@@ -202,128 +202,163 @@ def compile_manifest(run):
 		'output': exp.info._exp_yml['output'] if 'output' in exp.info._exp_yml else None
 	})
 
-def invoke_run(manifest):
-	# Create the output file. This signals that the run has been started.
-	(stdout_pipe, stdout) = (None, None)
-	with open(manifest.output_file_path('out'), "w") as f:
-		# We do not actually need to write anything to the output file.
-		# However, we might want to pipe experimental output to it.
+# Dumps data from an FD to the FS.
+# Creates the output file only if something is written.
+class LazyWriter:
+	def __init__(self, fd, path):
+		self._fd = fd
+		self._path = path
+		self._out = None
+
+	def progress(self):
+		# Specify some chunk size to avoid reading the whole pipe at once.
+		chunk = os.read(self._fd, 16 * 1024)
+		if not len(chunk):
+			return False
+
+		if self._out is None:
+			self._out = open(self._path, "wb")
+		self._out.write(chunk)
+		self._out.flush()
+		return True
+
+class Invocation:
+	def __init__(self):
+		self.selector = None
+		self.outfile = None
+		self.stdout = None
+		self.stderr = None
+		self.stdout_writer = None
+		self.stderr_writer = None
+		self.stdout_pipe = None
+		self.stderr_pipe = None
+		self.process = None
+
+	def __enter__(self):
+		self.selector = selectors.DefaultSelector()
+		return self
+
+	def __exit__(self, *_):
+		# TODO: kill the process if it is still running?
+
+		if self.outfile is not None:
+			os.close(self.outfile)
+		if self.stdout is not None:
+			os.close(self.stdout)
+		if self.stderr is not None:
+			os.close(self.stderr)
+		if self.stdout_pipe is not None:
+			os.close(self.stdout_pipe)
+		if self.stderr_pipe is not None:
+			os.close(self.stderr_pipe)
+		self.selector.close()
+
+		self.selector = None
+		self.outfile = None
+		self.stdout = None
+		self.stderr = None
+		self.stdout_writer = None
+		self.stderr_writer = None
+		self.stdout_pipe = None
+		self.stderr_pipe = None
+		self.process = None
+
+	def run(self, manifest):
+		with open(manifest.output_file_path('out'), "w") as f:
+			self.outfile = os.dup(f.fileno())
+
+		# Create the output file. This signals that the run has been started.
 		if manifest.output == 'stdout':
-			stdout = os.dup(f.fileno())
+			self.stdout = os.dup(self.outfile)
 		else:
-			(stdout_pipe, stdout) = os.pipe()
-			os.set_blocking(stdout_pipe, False)
+			(self.stdout_pipe, self.stdout) = os.pipe()
+			os.set_blocking(self.stdout_pipe, False)
 
-	# Create the error file.
-	(stderr_pipe, stderr) = os.pipe()
-	os.set_blocking(stderr_pipe, False)
+		# Create the error file.
+		(self.stderr_pipe, self.stderr) = os.pipe()
+		os.set_blocking(self.stderr_pipe, False)
 
-	def substitute(p):
-		if p == 'INSTANCE':
-			return manifest.instance_dir + '/' + manifest.instance
-		elif p == 'REPETITION':
-			return str(manifest.repetition)
-		elif p == 'OUTPUT':
-			return manifest.output_file_path('out')
+		def substitute(p):
+			if p == 'INSTANCE':
+				return manifest.instance_dir + '/' + manifest.instance
+			elif p == 'REPETITION':
+				return str(manifest.repetition)
+			elif p == 'OUTPUT':
+				return manifest.output_file_path('out')
+			else:
+				return None
+
+		def substitute_list(p):
+			if p == 'EXTRA_ARGS':
+				return manifest.get_extra_args()
+			else:
+				return None
+
+		cmd = util.expand_at_params(manifest.args, substitute, listfn=substitute_list)
+
+		# Build the environment.
+		def prepend_env(var, items):
+			if(var in os.environ):
+				return ':'.join(items) + ':' + os.environ[var]
+			return ':'.join(items)
+
+		environ = os.environ.copy()
+		environ['PATH'] = prepend_env('PATH', manifest.get_paths())
+		environ['LD_LIBRARY_PATH'] = prepend_env('LD_LIBRARY_PATH', manifest.get_ldso_paths())
+		environ['PYTHONPATH'] = prepend_env('PYTHONPATH', manifest.get_python_paths())
+		environ.update(manifest.environ)
+
+		start = time.perf_counter()
+		self.process = subprocess.Popen(cmd, cwd=manifest.base_dir, env=environ,
+				stdout=self.stdout, stderr=self.stderr)
+
+		if manifest.output != 'stdout':
+			self.stdout_writer = LazyWriter(self.stdout_pipe, manifest.aux_file_path('stdout'))
+			self.selector.register(self.stdout_pipe, selectors.EVENT_READ, self.stdout_writer)
+		self.stderr_writer = LazyWriter(self.stderr_pipe, manifest.aux_file_path('stderr'))
+		self.selector.register(self.stderr_pipe, selectors.EVENT_READ, self.stderr_writer)
+
+		# Wait until the run program finishes.
+		while True:
+			if self.process.poll() is not None:
+				break
+
+			elapsed = time.perf_counter() - start
+			if manifest.timeout is not None and elapsed > manifest.timeout:
+				self.process.send_signal(signal.SIGXCPU)
+
+			# Consume any output that might be ready.
+			events = self.selector.select(timeout=1)
+			for (sk, mask) in events:
+				if not sk.data.progress():
+					self.selector.unregister(sk.fd)
+
+		# Consume all remaining output.
+		while True:
+			events = self.selector.select(timeout=0)
+			for (sk, mask) in events:
+				if not sk.data.progress():
+					self.selector.unregister(sk.fd)
+			if not events:
+				break
+		runtime = time.perf_counter() - start
+
+		# Collect the status information.
+		status = None
+		sigcode = None
+		if self.process.returncode < 0: # Killed by a signal?
+			sigcode = signal.Signals(-self.process.returncode).name
 		else:
-			return None
+			status = self.process.returncode
+		did_timeout = manifest.timeout is not None and runtime > manifest.timeout
 
-	def substitute_list(p):
-		if p == 'EXTRA_ARGS':
-			return manifest.get_extra_args()
-		else:
-			return None
+		# Create the status file to signal that we are finished.
+		status_dict = {'timeout': did_timeout, 'walltime': runtime,
+				'status': status, 'signal': sigcode}
+		with open(manifest.output_file_path('status.tmp'), "w") as f:
+			yaml.dump(status_dict, f)
+		os.rename(manifest.output_file_path('status.tmp'), manifest.output_file_path('status'))
 
-	cmd = util.expand_at_params(manifest.args, substitute, listfn=substitute_list)
-
-	# Build the environment.
-	def prepend_env(var, items):
-		if(var in os.environ):
-			return ':'.join(items) + ':' + os.environ[var]
-		return ':'.join(items)
-
-	environ = os.environ.copy()
-	environ['PATH'] = prepend_env('PATH', manifest.get_paths())
-	environ['LD_LIBRARY_PATH'] = prepend_env('LD_LIBRARY_PATH', manifest.get_ldso_paths())
-	environ['PYTHONPATH'] = prepend_env('PYTHONPATH', manifest.get_python_paths())
-	environ.update(manifest.environ)
-
-	# Dumps data from an FD to the FS.
-	# Creates the output file only if something is written.
-	class LazyWriter:
-		def __init__(self, fd, path):
-			self._fd = fd
-			self._path = path
-			self._out = None
-
-		def progress(self):
-			# Specify some chunk size to avoid reading the whole pipe at once.
-			chunk = os.read(self._fd, 16 * 1024)
-			if not len(chunk):
-				return False
-
-			if self._out is None:
-				self._out = open(self._path, "wb")
-			self._out.write(chunk)
-			self._out.flush()
-			return True
-
-		def close(self):
-			if self._out is not None:
-				self._out.close()
-
-	start = time.perf_counter()
-	child = subprocess.Popen(cmd, cwd=manifest.base_dir, env=environ,
-			stdout=stdout, stderr=stderr)
-	sel = selectors.DefaultSelector()
-
-	if manifest.output != 'stdout':
-		stdout_writer = LazyWriter(stdout_pipe, manifest.aux_file_path('stdout'))
-		sel.register(stdout_pipe, selectors.EVENT_READ, stdout_writer)
-	stderr_writer = LazyWriter(stderr_pipe, manifest.aux_file_path('stderr'))
-	sel.register(stderr_pipe, selectors.EVENT_READ, stderr_writer)
-
-	# Wait until the run program finishes.
-	while True:
-		if child.poll() is not None:
-			break
-
-		elapsed = time.perf_counter() - start
-		if manifest.timeout is not None and elapsed > manifest.timeout:
-			child.send_signal(signal.SIGXCPU)
-
-		# Consume any output that might be ready.
-		events = sel.select(timeout=1)
-		for (sk, mask) in events:
-			if not sk.data.progress():
-				sel.unregister(sk.fd)
-
-	# Consume all remaining output.
-	while True:
-		events = sel.select(timeout=0)
-		for (sk, mask) in events:
-			if not sk.data.progress():
-				sel.unregister(sk.fd)
-		if not events:
-			break
-	if manifest.output != 'stdout':
-		stdout_writer.close()
-	stderr_writer.close()
-	runtime = time.perf_counter() - start
-
-	# Collect the status information.
-	status = None
-	sigcode = None
-	if child.returncode < 0: # Killed by a signal?
-		sigcode = signal.Signals(-child.returncode).name
-	else:
-		status = child.returncode
-	did_timeout = manifest.timeout is not None and runtime > manifest.timeout
-
-	# Create the status file to signal that we are finished.
-	status_dict = {'timeout': did_timeout, 'walltime': runtime,
-			'status': status, 'signal': sigcode}
-	with open(manifest.output_file_path('status.tmp'), "w") as f:
-		yaml.dump(status_dict, f)
-	os.rename(manifest.output_file_path('status.tmp'), manifest.output_file_path('status'))
-
+def invoke_run(manifest):
+	with Invocation() as invc:
+		invc.run(manifest)
