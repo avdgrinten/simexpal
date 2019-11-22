@@ -233,9 +233,15 @@ class Invocation:
 		self.stdout_pipe = None
 		self.stderr_pipe = None
 		self.process = None
+		self.wait_for_process = None
+		self.wait_for_stdout = None
+		self.wait_for_stderr = None
 
 	def __enter__(self):
 		self.selector = selectors.DefaultSelector()
+		self.wait_for_process = False
+		self.wait_for_stdout = False
+		self.wait_for_stderr = False
 		return self
 
 	def __exit__(self, *_):
@@ -308,39 +314,54 @@ class Invocation:
 		environ['PYTHONPATH'] = prepend_env('PYTHONPATH', manifest.get_python_paths())
 		environ.update(manifest.environ)
 
-		start = time.perf_counter()
-		self.process = subprocess.Popen(cmd, cwd=manifest.base_dir, env=environ,
-				stdout=self.stdout, stderr=self.stderr)
-
 		if manifest.output != 'stdout':
 			self.stdout_writer = LazyWriter(self.stdout_pipe, manifest.aux_file_path('stdout'))
-			self.selector.register(self.stdout_pipe, selectors.EVENT_READ, self.stdout_writer)
+			self.selector.register(self.stdout_pipe, selectors.EVENT_READ)
+			self.wait_for_stdout = True
 		self.stderr_writer = LazyWriter(self.stderr_pipe, manifest.aux_file_path('stderr'))
-		self.selector.register(self.stderr_pipe, selectors.EVENT_READ, self.stderr_writer)
+		self.selector.register(self.stderr_pipe, selectors.EVENT_READ)
+		self.wait_for_stderr = True
 
-		# Wait until the run program finishes.
-		while True:
-			if self.process.poll() is not None:
-				break
+		# Launch the process.
+		# We also need to close our copies of the FDs so that the selector handles EOF correctly.
+		self.process = subprocess.Popen(cmd, cwd=manifest.base_dir, env=environ,
+				stdout=self.stdout, stderr=self.stderr)
+		os.close(self.stdout)
+		self.stdout = None
+		os.close(self.stderr)
+		self.stderr = None
+		self.wait_for_process = True
+		start = time.perf_counter()
 
-			elapsed = time.perf_counter() - start
-			if manifest.timeout is not None and elapsed > manifest.timeout:
-				self.process.send_signal(signal.SIGXCPU)
+		# Monitor the process.
+		while (self.wait_for_process or self.wait_for_stdout or self.wait_for_stderr):
+			# Check whether the process terminated.
+			if self.wait_for_process:
+				if self.process.poll() is None:
+					elapsed = time.perf_counter() - start
+					if manifest.timeout is not None and elapsed > manifest.timeout:
+						self.process.send_signal(signal.SIGXCPU)
+				else:
+					self.wait_for_process = False
+					continue
 
-			# Consume any output that might be ready.
+			# Check the status of all FDs.
 			events = self.selector.select(timeout=1)
 			for (sk, mask) in events:
-				if not sk.data.progress():
-					self.selector.unregister(sk.fd)
+				assert sk.fd is not None
+				if sk.fd == self.stdout_pipe:
+					assert self.wait_for_stdout
+					if not self.stdout_writer.progress():
+						self.selector.unregister(self.stdout_pipe)
+						self.wait_for_stdout = False
+				elif sk.fd == self.stderr_pipe:
+					assert self.wait_for_stderr
+					if not self.stderr_writer.progress():
+						self.selector.unregister(self.stderr_pipe)
+						self.wait_for_stderr = False
+				else:
+					raise RuntimeError('unexpected event from selector')
 
-		# Consume all remaining output.
-		while True:
-			events = self.selector.select(timeout=0)
-			for (sk, mask) in events:
-				if not sk.data.progress():
-					self.selector.unregister(sk.fd)
-			if not events:
-				break
 		runtime = time.perf_counter() - start
 
 		# Collect the status information.
